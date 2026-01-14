@@ -1,8 +1,16 @@
+# Web Framework & Server
 fastapi
 uvicorn[standard]
+
+# HTTP Clients & Scraping
 httpx
 beautifulsoup4
-cachetools
-slowapi
 cloudscraper
 playwright
+
+# Rate Limiting & Caching
+slowapi
+cachetools
+
+# Parsing (Optional but recommended for BeautifulSoup)
+lxml
