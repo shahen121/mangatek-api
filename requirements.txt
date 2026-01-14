@@ -5,4 +5,3 @@ beautifulsoup4
 cachetools
 slowapi
 cloudscraper
-python-dotenv
