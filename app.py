@@ -1,4 +1,4 @@
-# app.py - Mangatek Scraper API (final)
+# app.py - Mangatek Scraper API (updated)
 import os
 import re
 import json
@@ -13,13 +13,13 @@ from fastapi.responses import JSONResponse
 from bs4 import BeautifulSoup
 from cachetools import TTLCache
 
-# slowapi for rate limit
+# slowapi for simple rate limiting
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
-# optional cloudscraper fallback (for pages protected by Cloudflare)
+# cloudscraper optional
 try:
     import cloudscraper
     _HAS_CLOUDSCRAPER = True
@@ -42,14 +42,19 @@ def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(status_code=429, content={"detail": "Too many requests, slow down."})
 
 
-# ---------- config ----------
-DOMAINS = [os.getenv("MANGATEK_DOMAIN", "https://mangatek.com")]
-CACHE_TTL = int(os.getenv("CACHE_TTL", 3600))  # default 1 hour
+# ---------- configuration ----------
+DOMAINS = [d.strip() for d in (os.getenv("MANGATEK_DOMAINS", "https://mangatek.com")).split(",") if d.strip()]
+CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 cache = TTLCache(maxsize=3000, ttl=CACHE_TTL)
 
-# Proxy env (optional)
-PROXY = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or None
-# if using SOCKS proxies make sure httpx[socks] is installed and the PROXY value starts with socks5://
+# Optional proxy config (single proxy or comma-separated list)
+PROXIES_ENV = os.getenv("HTTP_PROXIES")  # example: "http://user:pass@1.2.3.4:8080,https://..."
+PROXY_LIST = [p.strip() for p in (PROXIES_ENV or "").split(",") if p.strip()]
+# if you want a single default proxy variable:
+SINGLE_PROXY = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or None
+
+# control behavior on upstream failure
+RETURN_EMPTY_ON_UPSTREAM_FAIL = os.getenv("RETURN_EMPTY_ON_UPSTREAM_FAIL", "false").lower() in ("1", "true", "yes")
 
 # user-agent pool
 UA_POOL = [
@@ -78,14 +83,12 @@ def make_abs(src: Optional[str], base: str) -> Optional[str]:
 
 
 def find_image_array_in_scripts(soup: BeautifulSoup) -> List[str]:
-    """Try to extract arrays of image urls embedded in scripts"""
     out = []
     scripts = soup.find_all("script")
     for s in scripts:
         txt = s.string or s.get_text() or ""
         if not txt or len(txt) < 50:
             continue
-        # find arrays like ["https://...","https://..."]
         arrs = re.findall(r'\[\s*(?:"https?://[^"\]]+"(?:\s*,\s*"https?://[^"\]]+")*)\s*\]', txt)
         for a in arrs:
             try:
@@ -94,7 +97,6 @@ def find_image_array_in_scripts(soup: BeautifulSoup) -> List[str]:
                     out.extend(parsed)
             except Exception:
                 continue
-        # try to find images: [...] inside JS objects
         m = re.search(r'["\']?images["\']?\s*:\s*(\[[^\]]+\])', txt, flags=re.DOTALL)
         if m:
             try:
@@ -113,68 +115,57 @@ def find_image_array_in_scripts(soup: BeautifulSoup) -> List[str]:
     return res
 
 
+def choose_proxy_for_request() -> Optional[str]:
+    """Return a proxy URL or None. Uses SINGLE_PROXY or rotates PROXY_LIST if provided."""
+    if SINGLE_PROXY:
+        return SINGLE_PROXY
+    if PROXY_LIST:
+        return random.choice(PROXY_LIST)
+    return None
+
+
 # ---------- fetch helpers ----------
 async def fetch_page_httpx(url: str, max_retries: int = 2, timeout: int = 20) -> str:
-    """
-    Async fetch using httpx.AsyncClient.
-    Pass proxies to AsyncClient constructor if PROXY set.
-    """
     last_exc = None
-    proxies_mapping = {"http://": PROXY, "https://": PROXY} if PROXY else None
-
     for attempt in range(1, max_retries + 2):
         ua = random.choice(UA_POOL)
         headers = {**DEFAULT_HEADERS, "User-Agent": ua}
+        proxy = choose_proxy_for_request()
+        proxies_mapping = None
+        if proxy:
+            # httpx expects dict mapping
+            proxies_mapping = {"http://": proxy, "https://": proxy}
+
         try:
-            logger.info("HTTPX try %s -> %s (UA=%s)", attempt, url, ua)
+            logger.info("httpx try %s -> %s (UA=%s proxy=%s)", attempt, url, ua, proxy)
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, proxies=proxies_mapping) as client:
                 resp = await client.get(url, headers=headers)
-                # don't raise immediately; allow fallback logic
                 if resp.status_code == 200 and resp.text and len(resp.text) > 50:
                     return resp.text
-                # handle 403 specially (let retries continue and maybe fallback)
-                if resp.status_code == 403:
-                    last_exc = httpx.HTTPStatusError("403 Forbidden", request=resp.request, response=resp)
-                    logger.warning("Received 403 for %s (attempt %s)", url, attempt)
-                else:
-                    last_exc = httpx.HTTPStatusError(f"{resp.status_code}", request=resp.request, response=resp)
-                    logger.warning("HTTP %s for %s (attempt %s)", resp.status_code, url, attempt)
+                last_exc = httpx.HTTPStatusError(f"{resp.status_code} for {url}", request=resp.request, response=resp)
+                logger.warning("httpx status %s for %s (attempt %s)", resp.status_code, url, attempt)
         except httpx.RequestError as e:
             last_exc = e
             logger.warning("httpx request error for %s: %s (attempt %s)", url, str(e), attempt)
-
         await asyncio.sleep(min(3, 1.5 ** attempt))
-
-    # if we get here, httpx failed -> raise last or generic
-    logger.error("httpx all attempts failed for %s", url)
-    if isinstance(last_exc, Exception):
-        raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {str(last_exc)}")
-    raise HTTPException(status_code=502, detail="Upstream fetch failed")
+    logger.error("httpx all attempts failed for %s (last_exc=%s)", url, str(last_exc))
+    raise HTTPException(status_code=502, detail=f"Upstream fetch failed (httpx). last_error={str(last_exc)}")
 
 
 def fetch_page_cloudscraper_sync(url: str, timeout: int = 20) -> str:
-    """
-    Blocking fetch using cloudscraper (suitable for Cloudflare-protected pages).
-    Intended to be used inside asyncio.to_thread().
-    """
     if not _HAS_CLOUDSCRAPER:
         raise RuntimeError("cloudscraper not installed")
-
     headers = {**DEFAULT_HEADERS, "User-Agent": random.choice(UA_POOL)}
     scr = cloudscraper.create_scraper()
-    if PROXY:
-        scr.proxies.update({"http": PROXY, "https": PROXY})
+    proxy = choose_proxy_for_request()
+    if proxy:
+        scr.proxies.update({"http": proxy, "https": proxy})
     r = scr.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
     return r.text
 
 
 async def fetch_html_try_domains(path_or_url: str, prefer_cloudscraper: bool = False) -> Tuple[str, str]:
-    """
-    Try configured DOMAINS. If path_or_url is a full url, try it directly.
-    prefer_cloudscraper=True will try cloudscraper first (good for pages that often return 403).
-    Returns (base_used, html_text).
-    """
     candidates = []
     if path_or_url.startswith("http"):
         candidates = [path_or_url]
@@ -183,13 +174,12 @@ async def fetch_html_try_domains(path_or_url: str, prefer_cloudscraper: bool = F
             candidates.append(base.rstrip("/") + "/" + path_or_url.lstrip("/"))
 
     last_exc = None
+    # Try cloudscraper first if requested and available (useful for CF-protected pages)
     for url in candidates:
         try:
             if prefer_cloudscraper and _HAS_CLOUDSCRAPER:
-                # run blocking cloudscraper in thread
                 logger.info("Using cloudscraper for %s", url)
                 html = await asyncio.to_thread(fetch_page_cloudscraper_sync, url)
-                # return base part
                 base = "/".join(url.split("/")[:3])
                 return base, html
             else:
@@ -197,17 +187,18 @@ async def fetch_html_try_domains(path_or_url: str, prefer_cloudscraper: bool = F
                 base = "/".join(url.split("/")[:3])
                 return base, html
         except HTTPException as e:
-            logger.warning("fetch attempt failed for %s -> %s", url, e.detail)
+            logger.warning("HTTPException fetching %s -> %s", url, e.detail)
             last_exc = e
         except Exception as e:
-            logger.warning("unexpected fetch error for %s -> %s", url, str(e))
+            logger.exception("Unexpected fetch error for %s", url)
             last_exc = e
             continue
 
-    logger.error("All domain attempts failed for %s", path_or_url)
-    if isinstance(last_exc, HTTPException):
-        raise last_exc
-    raise HTTPException(status_code=502, detail="Failed to fetch source from upstream (tried domains)")
+    logger.error("All domain attempts failed for %s; last_error=%s", path_or_url, getattr(last_exc, "detail", str(last_exc)))
+    # If configured to return empty lists rather than raise, do so
+    if RETURN_EMPTY_ON_UPSTREAM_FAIL:
+        raise HTTPException(status_code=502, detail=f"Upstream failed but returning empty result (last_error={getattr(last_exc,'detail',str(last_exc))})")
+    raise HTTPException(status_code=502, detail=f"Failed to fetch source from upstream (tried domains). last_error={getattr(last_exc,'detail',str(last_exc))}")
 
 
 # -------------------- Endpoints --------------------
@@ -217,7 +208,7 @@ async def health():
     return {"ok": True}
 
 
-# ---------- manga-list (use cloudscraper fallback because this endpoint often blocked) ----------
+# ---------- manga-list ----------
 @app.get("/manga-list")
 @limiter.limit("10/minute")
 async def manga_list(request: Request, sort: str = Query("views"), page: int = Query(1, ge=1)):
@@ -228,33 +219,49 @@ async def manga_list(request: Request, sort: str = Query("views"), page: int = Q
 
     path = f"/manga-list?sort={sort}&page={page}"
 
-    # use cloudscraper for manga-list because site often returns 403 to simple requests
+    # prefer cloudscraper for this endpoint because it's frequently CF-protected
     prefer_cloud = True if _HAS_CLOUDSCRAPER else False
-    base, html = await fetch_html_try_domains(path, prefer_cloudscraper=prefer_cloud)
+
+    try:
+        base, html = await fetch_html_try_domains(path, prefer_cloudscraper=prefer_cloud)
+    except HTTPException as e:
+        # log and either return empty list or raise based on env
+        logger.error("manga-list fetch failed: %s", e.detail)
+        if RETURN_EMPTY_ON_UPSTREAM_FAIL:
+            return {"items": [], "pagination": {"current": page, "pages": []}}
+        raise
 
     soup = BeautifulSoup(html, "html.parser")
 
     items = []
-    # common card selectors (mangatek markup)
-    selectors = [".manga-card", ".manga-chapter", ".ml-item", ".manga-item", "a.manga-card", ".item"]
-    used_sel = None
+    selectors = [".manga-card", ".manga-chapter", ".manga-item", "a.manga-card", ".ml-item"]
+    found_sel = None
     for sel in selectors:
         cards = soup.select(sel)
         if cards:
-            used_sel = sel
+            found_sel = sel
             logger.info("manga-list: found selector %s (%d)", sel, len(cards))
             for card in cards:
                 a = card if card.name == "a" else (card.select_one("a") or card)
                 href = a.get("href") or a.get("data-href") or ""
                 img = a.select_one("img")
-                cover = img.get("data-src") or img.get("src") if img else None
-                # title: try elements then attributes
+                cover = None
+                if img:
+                    cover = img.get("data-src") or img.get("src")
+                # title safe extraction
+                title = None
                 title_el = a.select_one(".title") or a.select_one("h3") or a.select_one(".tt")
                 if title_el and title_el.get_text(strip=True):
                     title = title_el.get_text(strip=True)
                 else:
-                    title = (img.get("alt") if img and img.get("alt") else (a.get("title") or a.get_text(strip=True) or "Unknown"))
-                slug = href.rstrip("/").split("/")[-1] if href else None
+                    if img and img.get("alt"):
+                        title = img.get("alt")
+                    else:
+                        title = a.get("title") or a.get_text(strip=True) or "Unknown"
+
+                slug = None
+                if href:
+                    slug = href.rstrip("/").split("/")[-1]
                 items.append({
                     "title": title,
                     "slug": slug,
@@ -263,11 +270,12 @@ async def manga_list(request: Request, sort: str = Query("views"), page: int = Q
                 })
             break
 
-    # fallback generic anchors
     if not items:
         logger.info("manga-list: fallback anchor scan")
         for a in soup.select("a[href*='/manga/']"):
             href = a.get("href")
+            if not href:
+                continue
             img = a.select_one("img")
             cover = img.get("data-src") or img.get("src") if img else None
             title = a.get_text(strip=True) or (img.get("alt") if img and img.get("alt") else "Unknown")
@@ -293,7 +301,14 @@ async def manga_detail(request: Request, slug: str):
         return cache[cache_key]
 
     path = f"/manga/{slug}"
-    base, html = await fetch_html_try_domains(path, prefer_cloudscraper=False)
+    try:
+        base, html = await fetch_html_try_domains(path, prefer_cloudscraper=False)
+    except HTTPException as e:
+        logger.error("manga_detail fetch failed: %s", e.detail)
+        if RETURN_EMPTY_ON_UPSTREAM_FAIL:
+            return {"title": slug, "slug": slug, "url": None, "description": None, "cover": None, "tags": [], "rating": None, "chapters": []}
+        raise
+
     soup = BeautifulSoup(html, "html.parser")
 
     title_el = soup.select_one("h1.entry-title") or soup.select_one("h1") or soup.select_one(".post-title")
@@ -310,7 +325,6 @@ async def manga_detail(request: Request, slug: str):
 
     tags = [t.get_text(strip=True) for t in soup.select(".mgen a, .genres a, .tags a")]
 
-    # chapters
     chapters = []
     for sel in [".chapter-list a", ".chapters a", ".eplister li a", ".wp-manga-chapter a", ".chapter a", "a[href*='/reader/']"]:
         els = soup.select(sel)
@@ -344,8 +358,14 @@ async def reader(request: Request, slug: str, chapter: int, debug: Optional[bool
         return cache[cache_key]
 
     path = f"/reader/{slug}/{chapter}"
-    # reader pages usually not heavily protected, try httpx first
-    base, html = await fetch_html_try_domains(path, prefer_cloudscraper=False)
+    try:
+        base, html = await fetch_html_try_domains(path, prefer_cloudscraper=False)
+    except HTTPException as e:
+        logger.error("reader fetch failed: %s", e.detail)
+        if RETURN_EMPTY_ON_UPSTREAM_FAIL:
+            return {"slug": slug, "chapter": chapter, "images": []}
+        raise
+
     soup = BeautifulSoup(html, "html.parser")
 
     images: List[str] = []
