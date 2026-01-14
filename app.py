@@ -1,25 +1,34 @@
-# app.py - Mangatek Scraper API (updated)
+# app.py - Mangatek Scraper API (with anti-block protections)
+# Features added vs your original file:
+# - cloudscraper fallback when httpx returns 403 (Cloudflare)
+# - retry loop with exponential backoff
+# - rotating User-Agents
+# - optional proxy support (env: HTTP_PROXIES or HTTP_PROXY)
+# - simple in-memory TTL cache (cachetools)
+# - slowapi rate limiting (requires Request param on endpoints)
+# - clearer logging for diagnostics
+
 import os
 import re
 import json
 import random
 import asyncio
 import logging
-from typing import List, Optional, Tuple
+from typing import List, Optional
+from urllib.parse import urljoin, unquote, urlparse
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Query, Request
 from bs4 import BeautifulSoup
 from cachetools import TTLCache
 
-# slowapi for simple rate limiting
+# slowapi
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
-# cloudscraper optional
+# optional cloudscraper (blocking) - used via asyncio.to_thread
 try:
     import cloudscraper
     _HAS_CLOUDSCRAPER = True
@@ -28,95 +37,109 @@ except Exception:
 
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("mangatek")
+logger = logging.getLogger("mangatek_scraper")
 
 # ---------- app & limiter ----------
-app = FastAPI(title="Mangatek Scraper", version="1.0.0")
+app = FastAPI(title="Mangatek Scraper API", version="0.4.0")
+RATE_LIMIT = os.getenv("RATE_LIMIT", "20/minute")
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
-
 @app.exception_handler(RateLimitExceeded)
-def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(status_code=429, content={"detail": "Too many requests, slow down."})
 
-
-# ---------- configuration ----------
-DOMAINS = [d.strip() for d in (os.getenv("MANGATEK_DOMAINS", "https://mangatek.com")).split(",") if d.strip()]
-CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
-cache = TTLCache(maxsize=3000, ttl=CACHE_TTL)
-
-# Optional proxy config (single proxy or comma-separated list)
-PROXIES_ENV = os.getenv("HTTP_PROXIES")  # example: "http://user:pass@1.2.3.4:8080,https://..."
-PROXY_LIST = [p.strip() for p in (PROXIES_ENV or "").split(",") if p.strip()]
-# if you want a single default proxy variable:
-SINGLE_PROXY = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or None
-
-# control behavior on upstream failure
-RETURN_EMPTY_ON_UPSTREAM_FAIL = os.getenv("RETURN_EMPTY_ON_UPSTREAM_FAIL", "false").lower() in ("1", "true", "yes")
-
-# user-agent pool
+# ---------- config ----------
+BASE = os.getenv("MANGATEK_BASE", "https://mangatek.com")
 UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
 ]
-
 DEFAULT_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
-    "Referer": "https://mangatek.com/",
+    "Referer": BASE + "/",
 }
 
+# caching
+CACHE_TTL = int(os.getenv("CACHE_TTL", "900"))
+cache = TTLCache(maxsize=2000, ttl=CACHE_TTL)
+
+# proxies: can supply HTTP_PROXIES as comma-separated list or HTTP_PROXY/HTTPS_PROXY single
+PROXIES_ENV = os.getenv("HTTP_PROXIES", "")
+PROXY_LIST = [p.strip() for p in PROXIES_ENV.split(",") if p.strip()]
+SINGLE_PROXY = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or None
+
+# if true, when failing upstream returns empty results instead of raising 502
+RETURN_EMPTY_ON_UPSTREAM_FAIL = os.getenv("RETURN_EMPTY_ON_UPSTREAM_FAIL", "false").lower() in ("1","true","yes")
 
 # ---------- helpers ----------
-def make_abs(src: Optional[str], base: str) -> Optional[str]:
-    if not src:
-        return None
-    src = src.strip()
-    if src.startswith("//"):
-        return "https:" + src
-    if src.startswith("http"):
-        return src
-    return base.rstrip("/") + "/" + src.lstrip("/")
+from fastapi.responses import JSONResponse
 
 
-def find_image_array_in_scripts(soup: BeautifulSoup) -> List[str]:
-    out = []
-    scripts = soup.find_all("script")
-    for s in scripts:
-        txt = s.string or s.get_text() or ""
-        if not txt or len(txt) < 50:
+def try_soup(html: str):
+    try:
+        return BeautifulSoup(html, "lxml")
+    except Exception:
+        return BeautifulSoup(html, "html.parser")
+
+
+def extract_slug_from_href(href: str) -> str:
+    if not href:
+        return ""
+    href = href.strip("/")
+    parts = href.split("/")
+    if "manga" in parts:
+        try:
+            return parts[parts.index("manga") + 1]
+        except Exception:
+            pass
+    if "reader" in parts:
+        try:
+            return parts[parts.index("reader") + 1]
+        except Exception:
+            pass
+    return parts[-1]
+
+
+def find_json_arrays_in_text(text: str) -> List:
+    found = []
+    arrays = re.findall(r"\[\s*(?:\"https?://[^\"]+\"(?:\s*,\s*\"https?://[^\"]+\")*)\s*\]", text)
+    for a in arrays:
+        try:
+            parsed = json.loads(a)
+            if isinstance(parsed, list):
+                found.extend(parsed)
+        except Exception:
             continue
-        arrs = re.findall(r'\[\s*(?:"https?://[^"\]]+"(?:\s*,\s*"https?://[^"\]]+")*)\s*\]', txt)
-        for a in arrs:
-            try:
-                parsed = json.loads(a)
-                if isinstance(parsed, list):
-                    out.extend(parsed)
-            except Exception:
-                continue
-        m = re.search(r'["\']?images["\']?\s*:\s*(\[[^\]]+\])', txt, flags=re.DOTALL)
-        if m:
-            try:
-                parsed = json.loads(m.group(1))
-                if isinstance(parsed, list):
-                    out.extend(parsed)
-            except Exception:
-                continue
-    # dedupe preserve order
+    m = re.findall(r'(["\']?images["\']?\s*:\s*\[.*?\])', text, flags=re.DOTALL)
+    for group in m:
+        try:
+            obj = "{" + group + "}"
+            parsed = json.loads(obj)
+            imgs = parsed.get("images") or []
+            found.extend(imgs)
+        except Exception:
+            continue
+    m2 = re.findall(r'=\s*\[.*?https?://.*?\]', text, flags=re.DOTALL)
+    for g in m2:
+        try:
+            parsed = json.loads(g.strip().lstrip("=").strip())
+            if isinstance(parsed, list):
+                found.extend(parsed)
+        except Exception:
+            continue
     seen = set()
-    res = []
-    for u in out:
-        if u not in seen:
-            seen.add(u)
-            res.append(u)
-    return res
+    uniq = []
+    for u in found:
+        if isinstance(u, str) and u not in seen:
+            uniq.append(u); seen.add(u)
+    return uniq
 
 
 def choose_proxy_for_request() -> Optional[str]:
-    """Return a proxy URL or None. Uses SINGLE_PROXY or rotates PROXY_LIST if provided."""
     if SINGLE_PROXY:
         return SINGLE_PROXY
     if PROXY_LIST:
@@ -124,31 +147,36 @@ def choose_proxy_for_request() -> Optional[str]:
     return None
 
 
-# ---------- fetch helpers ----------
-async def fetch_page_httpx(url: str, max_retries: int = 2, timeout: int = 20) -> str:
+# ---------- fetch helpers with anti-block logic ----------
+async def fetch_page_httpx(url: str, max_retries: int = 3, timeout: int = 20) -> str:
     last_exc = None
-    for attempt in range(1, max_retries + 2):
+    for attempt in range(1, max_retries + 1):
         ua = random.choice(UA_POOL)
         headers = {**DEFAULT_HEADERS, "User-Agent": ua}
         proxy = choose_proxy_for_request()
         proxies_mapping = None
         if proxy:
-            # httpx expects dict mapping
             proxies_mapping = {"http://": proxy, "https://": proxy}
-
         try:
             logger.info("httpx try %s -> %s (UA=%s proxy=%s)", attempt, url, ua, proxy)
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, proxies=proxies_mapping) as client:
+            timeout_cfg = httpx.Timeout(timeout)
+            async with httpx.AsyncClient(timeout=timeout_cfg, follow_redirects=True, proxies=proxies_mapping) as client:
                 resp = await client.get(url, headers=headers)
-                if resp.status_code == 200 and resp.text and len(resp.text) > 50:
+                # handle Cloudflare-ish responses: 403 or challenge pages
+                if resp.status_code == 403 or resp.status_code == 429:
+                    last_exc = httpx.HTTPStatusError(f"{resp.status_code} for {url}", request=resp.request, response=resp)
+                    logger.warning("httpx got %s for %s (attempt %s)", resp.status_code, url, attempt)
+                    # small wait then retry (maybe proxy rotate)
+                    await asyncio.sleep(1 + attempt)
+                    continue
+                resp.raise_for_status()
+                if resp.text and len(resp.text) > 50:
                     return resp.text
-                last_exc = httpx.HTTPStatusError(f"{resp.status_code} for {url}", request=resp.request, response=resp)
-                logger.warning("httpx status %s for %s (attempt %s)", resp.status_code, url, attempt)
-        except httpx.RequestError as e:
+                last_exc = Exception("Empty or too short response")
+        except Exception as e:
             last_exc = e
             logger.warning("httpx request error for %s: %s (attempt %s)", url, str(e), attempt)
-        await asyncio.sleep(min(3, 1.5 ** attempt))
-    logger.error("httpx all attempts failed for %s (last_exc=%s)", url, str(last_exc))
+        await asyncio.sleep(min(4, 1.5 ** attempt))
     raise HTTPException(status_code=502, detail=f"Upstream fetch failed (httpx). last_error={str(last_exc)}")
 
 
@@ -165,238 +193,235 @@ def fetch_page_cloudscraper_sync(url: str, timeout: int = 20) -> str:
     return r.text
 
 
-async def fetch_html_try_domains(path_or_url: str, prefer_cloudscraper: bool = False) -> Tuple[str, str]:
-    candidates = []
-    if path_or_url.startswith("http"):
-        candidates = [path_or_url]
-    else:
-        for base in DOMAINS:
-            candidates.append(base.rstrip("/") + "/" + path_or_url.lstrip("/"))
-
-    last_exc = None
-    # Try cloudscraper first if requested and available (useful for CF-protected pages)
-    for url in candidates:
-        try:
-            if prefer_cloudscraper and _HAS_CLOUDSCRAPER:
-                logger.info("Using cloudscraper for %s", url)
-                html = await asyncio.to_thread(fetch_page_cloudscraper_sync, url)
-                base = "/".join(url.split("/")[:3])
-                return base, html
-            else:
-                html = await fetch_page_httpx(url)
-                base = "/".join(url.split("/")[:3])
-                return base, html
-        except HTTPException as e:
-            logger.warning("HTTPException fetching %s -> %s", url, e.detail)
-            last_exc = e
-        except Exception as e:
-            logger.exception("Unexpected fetch error for %s", url)
-            last_exc = e
-            continue
-
-    logger.error("All domain attempts failed for %s; last_error=%s", path_or_url, getattr(last_exc, "detail", str(last_exc)))
-    # If configured to return empty lists rather than raise, do so
-    if RETURN_EMPTY_ON_UPSTREAM_FAIL:
-        raise HTTPException(status_code=502, detail=f"Upstream failed but returning empty result (last_error={getattr(last_exc,'detail',str(last_exc))})")
-    raise HTTPException(status_code=502, detail=f"Failed to fetch source from upstream (tried domains). last_error={getattr(last_exc,'detail',str(last_exc))}")
+async def fetch_html(url: str, timeout: int = 20) -> str:
+    # Try httpx first, but if 403 detected then try cloudscraper (blocking) as fallback
+    try:
+        return await fetch_page_httpx(url, max_retries=2, timeout=timeout)
+    except HTTPException as e:
+        # If it's a 403/Cloudflare-like, attempt cloudscraper
+        logger.warning("httpx failed; trying cloudscraper for %s; reason=%s", url, e.detail)
+        if _HAS_CLOUDSCRAPER:
+            try:
+                html = await asyncio.to_thread(fetch_page_cloudscraper_sync, url, timeout)
+                return html
+            except Exception as ce:
+                logger.exception("cloudscraper also failed for %s", url)
+                raise HTTPException(status_code=502, detail=f"Both httpx and cloudscraper failed. last={str(ce)}")
+        else:
+            raise
 
 
-# -------------------- Endpoints --------------------
+# -------------------- Endpoints (adapted) --------------------
 
 @app.get("/_health")
 async def health():
     return {"ok": True}
 
 
-# ---------- manga-list ----------
 @app.get("/manga-list")
-@limiter.limit("10/minute")
+@limiter.limit(RATE_LIMIT)
 async def manga_list(request: Request, sort: str = Query("views"), page: int = Query(1, ge=1)):
     cache_key = f"list::{sort}::{page}"
     if cache_key in cache:
-        logger.info("cache hit %s", cache_key)
         return cache[cache_key]
 
-    path = f"/manga-list?sort={sort}&page={page}"
-
-    # prefer cloudscraper for this endpoint because it's frequently CF-protected
-    prefer_cloud = True if _HAS_CLOUDSCRAPER else False
+    url = f"{BASE}/manga-list?sort={sort}"
+    if page > 1:
+        url += f"&page={page}"
 
     try:
-        base, html = await fetch_html_try_domains(path, prefer_cloudscraper=prefer_cloud)
+        html = await fetch_html(url)
     except HTTPException as e:
-        # log and either return empty list or raise based on env
-        logger.error("manga-list fetch failed: %s", e.detail)
+        logger.exception("Failed fetching manga-list: %s", e.detail)
         if RETURN_EMPTY_ON_UPSTREAM_FAIL:
             return {"items": [], "pagination": {"current": page, "pages": []}}
         raise
 
-    soup = BeautifulSoup(html, "html.parser")
-
+    soup = try_soup(html)
     items = []
-    selectors = [".manga-card", ".manga-chapter", ".manga-item", "a.manga-card", ".ml-item"]
-    found_sel = None
-    for sel in selectors:
-        cards = soup.select(sel)
-        if cards:
-            found_sel = sel
-            logger.info("manga-list: found selector %s (%d)", sel, len(cards))
-            for card in cards:
-                a = card if card.name == "a" else (card.select_one("a") or card)
-                href = a.get("href") or a.get("data-href") or ""
-                img = a.select_one("img")
-                cover = None
-                if img:
-                    cover = img.get("data-src") or img.get("src")
-                # title safe extraction
-                title = None
-                title_el = a.select_one(".title") or a.select_one("h3") or a.select_one(".tt")
-                if title_el and title_el.get_text(strip=True):
-                    title = title_el.get_text(strip=True)
-                else:
-                    if img and img.get("alt"):
-                        title = img.get("alt")
-                    else:
-                        title = a.get("title") or a.get_text(strip=True) or "Unknown"
+    seen_slugs = set()
 
-                slug = None
-                if href:
-                    slug = href.rstrip("/").split("/")[-1]
-                items.append({
-                    "title": title,
-                    "slug": slug,
-                    "url": make_abs(href, base) if href else None,
-                    "cover": make_abs(cover, base) if cover else None
-                })
-            break
+    for a in soup.select("a.manga-card"):
+        href = a.get("href") or ""
+        slug = extract_slug_from_href(href)
+        if not slug or slug in seen_slugs:
+            continue
+        seen_slugs.add(slug)
+        img = a.select_one("img")
+        title = (img.get("alt") if img and img.get("alt") else a.get_text(strip=True)) or slug
+        cover = img.get("data-src") or (img.get("src") if img else None)
+        items.append({"title": title.strip(), "slug": slug, "url": urljoin(BASE, href), "cover": cover})
 
     if not items:
-        logger.info("manga-list: fallback anchor scan")
         for a in soup.select("a[href*='/manga/']"):
-            href = a.get("href")
-            if not href:
+            href = a.get("href") or ""
+            slug = extract_slug_from_href(href)
+            if not slug or slug in seen_slugs:
                 continue
+            seen_slugs.add(slug)
+            title_el = a.select_one("h3") or a.select_one(".title") or a.select_one("h2")
+            title = title_el.get_text(strip=True) if title_el else a.get_text(strip=True)
             img = a.select_one("img")
-            cover = img.get("data-src") or img.get("src") if img else None
-            title = a.get_text(strip=True) or (img.get("alt") if img and img.get("alt") else "Unknown")
-            slug = href.rstrip("/").split("/")[-1]
-            items.append({
-                "title": title,
-                "slug": slug,
-                "url": make_abs(href, base),
-                "cover": make_abs(cover, base) if cover else None
-            })
+            cover = img.get("data-src") or (img.get("src") if img else None)
+            items.append({"title": title.strip(), "slug": slug, "url": urljoin(BASE, href), "cover": cover})
 
-    result = {"items": items, "pagination": {"current": page, "pages": []}}
+    pagination = {"current": page, "pages": []}
+    pager = soup.select_one("nav[aria-label='الصفحات']") or soup.select_one(".pagination") or soup.select_one(".pagenavi")
+    if pager:
+        for a in pager.select("a[href]"):
+            href = a.get("href")
+            text = a.get_text(strip=True)
+            pagination["pages"].append({"page": text, "url": urljoin(BASE, href)})
+
+    result = {"items": items, "pagination": pagination}
     cache[cache_key] = result
     return result
 
 
-# ---------- manga detail ----------
 @app.get("/manga/{slug}")
-@limiter.limit("10/minute")
+@limiter.limit(RATE_LIMIT)
 async def manga_detail(request: Request, slug: str):
     cache_key = f"detail::{slug}"
     if cache_key in cache:
         return cache[cache_key]
 
-    path = f"/manga/{slug}"
+    url = f"{BASE}/manga/{slug}"
     try:
-        base, html = await fetch_html_try_domains(path, prefer_cloudscraper=False)
+        html = await fetch_html(url)
     except HTTPException as e:
-        logger.error("manga_detail fetch failed: %s", e.detail)
+        logger.exception("manga_detail fetch failed: %s", e.detail)
         if RETURN_EMPTY_ON_UPSTREAM_FAIL:
             return {"title": slug, "slug": slug, "url": None, "description": None, "cover": None, "tags": [], "rating": None, "chapters": []}
         raise
 
-    soup = BeautifulSoup(html, "html.parser")
-
-    title_el = soup.select_one("h1.entry-title") or soup.select_one("h1") or soup.select_one(".post-title")
+    soup = try_soup(html)
+    title_el = soup.select_one("h1") or soup.select_one(".title") or soup.select_one(".entry-title")
     title = title_el.get_text(strip=True) if title_el else slug
 
-    desc_el = soup.select_one(".description p") or soup.select_one(".entry-content p") or soup.select_one("meta[name='description']")
+    desc = None
+    desc_el = soup.select_one("p.text-gray-300") or soup.select_one(".description") or soup.select_one(".entry-content p") or soup.select_one("meta[name='description']")
     if desc_el:
-        description = desc_el.get("content") if desc_el.name == "meta" else desc_el.get_text(" ", strip=True)
-    else:
-        description = None
+        desc = desc_el.get("content") if desc_el.name == "meta" else desc_el.get_text(strip=True)
 
-    cov_el = soup.select_one(".thumb img") or soup.select_one(".summary_image img") or soup.select_one(".cover img")
-    cover = cov_el.get("data-src") or cov_el.get("src") if cov_el else None
+    cover = None
+    cov = soup.select_one("img.cover") or soup.select_one(".cover img") or soup.select_one(".thumb img")
+    if cov:
+        cover = cov.get("data-src") or cov.get("src")
 
-    tags = [t.get_text(strip=True) for t in soup.select(".mgen a, .genres a, .tags a")]
+    tags = [t.get_text(strip=True) for t in soup.select(".tags span, .genres span, .tag a")]
 
     chapters = []
-    for sel in [".chapter-list a", ".chapters a", ".eplister li a", ".wp-manga-chapter a", ".chapter a", "a[href*='/reader/']"]:
-        els = soup.select(sel)
-        if els:
-            for a in els:
-                href = a.get("href") or ""
-                chap_num = href.rstrip("/").split("/")[-1] if href else None
-                chapters.append({"chapter_number": chap_num, "url": make_abs(href, base), "title": a.get_text(strip=True)})
-            break
+    for a in soup.select("a[href*='/reader/']"):
+        href = a.get("href") or ""
+        chap_match = re.search(r"/reader/([^/]+)/([0-9]+)", href)
+        if chap_match:
+            chap_num = chap_match.group(2)
+            chapters.append({"chapter_number": chap_num, "url": urljoin(BASE, href), "title": a.get_text(strip=True)})
 
-    result = {
-        "title": title,
-        "slug": slug,
-        "url": make_abs(path, base),
-        "description": description,
-        "cover": make_abs(cover, base) if cover else None,
-        "tags": tags,
-        "rating": None,
-        "chapters": chapters
-    }
-    cache[cache_key] = result
-    return result
+    if not chapters:
+        for a in soup.select("a[href*='/manga/']"):
+            href = a.get("href") or ""
+            m = re.search(r"/manga/([^/]+)/([0-9]+)", href)
+            if m:
+                chapters.append({"chapter_number": m.group(2), "url": urljoin(BASE, href), "title": a.get_text(strip=True)})
+
+    res = {"title": title, "slug": slug, "url": url, "description": desc, "cover": cover, "tags": tags, "rating": None, "chapters": chapters}
+    cache[cache_key] = res
+    return res
 
 
-# ---------- reader ----------
 @app.get("/reader/{slug}/{chapter}")
-@limiter.limit("20/minute")
-async def reader(request: Request, slug: str, chapter: int, debug: Optional[bool] = Query(False)):
+@limiter.limit(RATE_LIMIT)
+async def reader(request: Request, slug: str, chapter: int):
     cache_key = f"reader::{slug}::{chapter}"
     if cache_key in cache:
         return cache[cache_key]
 
-    path = f"/reader/{slug}/{chapter}"
+    url = f"{BASE}/reader/{slug}/{chapter}"
     try:
-        base, html = await fetch_html_try_domains(path, prefer_cloudscraper=False)
+        html = await fetch_html(url)
     except HTTPException as e:
-        logger.error("reader fetch failed: %s", e.detail)
+        logger.exception("reader fetch failed: %s", e.detail)
         if RETURN_EMPTY_ON_UPSTREAM_FAIL:
             return {"slug": slug, "chapter": chapter, "images": []}
         raise
 
-    soup = BeautifulSoup(html, "html.parser")
+    soup = try_soup(html)
+    images = []
 
-    images: List[str] = []
-    selectors = [".reading-content img", ".reader-area img", ".chapter-images img", ".rdminimal img", ".page img", ".reader img", "article img"]
-    for sel in selectors:
-        imgs = soup.select(sel)
-        if imgs:
-            logger.info("reader: using selector %s (%d imgs)", sel, len(imgs))
-            for im in imgs:
-                src = im.get("data-src") or im.get("data-lazy-src") or im.get("src")
-                if src:
-                    images.append(make_abs(src, base))
+    for sel in [".reader", ".reader-container", ".chapter-images", "#reader", ".rdminimal", ".page"]:
+        container = soup.select_one(sel)
+        if container:
+            for img in container.select("img"):
+                src = img.get("data-src") or img.get("data-lazy-src") or img.get("src")
+                if src and not src.startswith("data:"):
+                    images.append(src)
             if images:
                 break
 
     if not images:
-        found = find_image_array_in_scripts(soup)
-        if found:
-            images = [make_abs(u, base) for u in found]
+        for img in soup.select("article img, .page img, .chapter img, img"):
+            src = img.get("data-src") or img.get("data-lazy-src") or img.get("src")
+            if src and not src.startswith("data:"):
+                images.append(src)
 
-    # dedupe and filter
+    if not images:
+        scripts = soup.find_all("script")
+        for s in scripts:
+            text = s.string or s.get_text() or ""
+            if not text or len(text) < 20:
+                continue
+            found = find_json_arrays_in_text(text)
+            if found:
+                images.extend(found)
+                break
+
+    clean = []
     seen = set()
-    final_images = []
-    for u in images:
-        if u and u not in seen:
-            seen.add(u)
-            final_images.append(u)
+    for src in images:
+        if not src:
+            continue
+        src = src.strip()
+        if src.startswith("//"):
+            src = "https:" + src
+        if src.startswith("/"):
+            src = urljoin(BASE, src)
+        ok = any(k in src for k in ["/reader/", "/manga/", "/uploads/", "/covers/", "api.mangatek", "/images/"])
+        if not ok and re.search(r'\.(jpe?g|png|webp)(?:\?|$)', src) and re.search(r'\d', src):
+            ok = True
+        if not ok:
+            continue
+        if src not in seen:
+            seen.add(src)
+            clean.append(src)
 
-    result = {"slug": slug, "chapter": chapter, "images": final_images}
-    if debug:
-        result["debug_html_snippet"] = html[:4000]
-
+    result = {"slug": slug, "chapter": chapter, "images": clean}
     cache[cache_key] = result
     return result
+
+
+@app.get("/reader/from-url")
+async def reader_from_url(url: str):
+    try:
+        decoded = unquote(url)
+    except:
+        decoded = url
+    try:
+        parsed = urlparse(decoded)
+        if parsed.netloc and "mangatek.com" not in parsed.netloc:
+            raise HTTPException(status_code=400, detail="Only mangatek.com URLs allowed")
+    except Exception:
+        pass
+    m = re.search(r"/reader/([^/]+)/([0-9]+)", decoded)
+    if m:
+        slug = m.group(1)
+        chapter = int(m.group(2))
+        return await reader(Request({}), slug, chapter)
+    m2 = re.search(r"/manga/([^/]+)", decoded)
+    if m2:
+        slug = m2.group(1)
+        mnum = re.search(r"/(\d+)(?:/?)$", decoded)
+        if mnum:
+            chapter = int(mnum.group(1))
+            return await reader(Request({}), slug, chapter)
+    raise HTTPException(status_code=400, detail="Could not extract slug/chapter from URL")
