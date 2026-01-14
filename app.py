@@ -1,4 +1,4 @@
-# app.py - Robust Mangatek scraper API
+# app.py - Robust Mangatek scraper API (fixed proxies usage)
 import os
 import re
 import json
@@ -50,6 +50,10 @@ cache = TTLCache(maxsize=2000, ttl=CACHE_TTL)
 
 # Proxy from env (optional). Example: http://user:pass@host:port
 PROXY = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or None
+
+# If you're using a SOCKS proxy (socks5://...), install httpx with socks:
+# pip install "httpx[socks]"
+# and ensure PROXY is like: socks5://user:pass@host:port
 
 # User-Agent pool
 UA_POOL = [
@@ -114,18 +118,23 @@ async def fetch_page(url: str, max_retries: int = 2, timeout: int = 20) -> str:
     Robust fetch:
       - rotates UA
       - retries with backoff
-      - supports proxy via env var
+      - supports proxy via env var (passed to AsyncClient constructor)
       - fallback to cloudscraper if 403 and cloudscraper present
     """
     last_exc = None
+    # build proxies mapping for httpx constructor if PROXY set
+    proxies_mapping = None
+    if PROXY:
+        proxies_mapping = {"http://": PROXY, "https://": PROXY}
+
     for attempt in range(1, max_retries + 2):
         ua = random.choice(UA_POOL)
         headers = {**DEFAULT_HEADERS, "User-Agent": ua}
         try:
             logger.info("HTTPX try %s -> %s (UA=%s)", attempt, url, ua)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                proxies = {"http://": PROXY, "https://": PROXY} if PROXY else None
-                r = await client.get(url, headers=headers, follow_redirects=True, proxies=proxies)
+            # pass proxies to AsyncClient constructor (not to .get)
+            async with httpx.AsyncClient(timeout=timeout, proxies=proxies_mapping) as client:
+                r = await client.get(url, headers=headers, follow_redirects=True)
                 if r.status_code == 200 and r.text and len(r.text) > 50:
                     return r.text
                 elif r.status_code == 403:
