@@ -5,3 +5,4 @@ beautifulsoup4
 cachetools
 slowapi
 cloudscraper
+playwright
