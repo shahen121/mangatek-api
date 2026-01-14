@@ -1,16 +1,20 @@
-# Web Framework & Server
+# requirements.txt
+# Framework & Server
 fastapi
 uvicorn[standard]
 
 # HTTP Clients & Scraping
 httpx
 beautifulsoup4
-cloudscraper
-playwright
+cloudscraper  # For bypassing Cloudflare protections
+playwright  # For browser automation if needed (run 'playwright install' post-install)
 
 # Rate Limiting & Caching
 slowapi
 cachetools
 
-# Parsing (Optional but recommended for BeautifulSoup)
+# Retry & Backoff
+backoff  # For exponential backoff with jitter
+
+# Parsing (Recommended for BeautifulSoup)
 lxml
