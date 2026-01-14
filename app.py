@@ -1,90 +1,59 @@
-# app.py - Mangatek Scraper API (with anti-block protections)
-# Features added vs your original file:
-# - cloudscraper fallback when httpx returns 403 (Cloudflare)
-# - retry loop with exponential backoff
-# - rotating User-Agents
-# - optional proxy support (env: HTTP_PROXIES or HTTP_PROXY)
-# - simple in-memory TTL cache (cachetools)
-# - slowapi rate limiting (requires Request param on endpoints)
-# - clearer logging for diagnostics
-
+# app.py - FastAPI mangatek scraper with Playwright fallback
 import os
 import re
 import json
-import random
 import asyncio
 import logging
 from typing import List, Optional
 from urllib.parse import urljoin, unquote, urlparse
 
-import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
-from bs4 import BeautifulSoup
-from cachetools import TTLCache
-
-# slowapi
-from slowapi import Limiter
+from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
-# optional cloudscraper (blocking) - used via asyncio.to_thread
-try:
-    import cloudscraper
-    _HAS_CLOUDSCRAPER = True
-except Exception:
-    _HAS_CLOUDSCRAPER = False
+import httpx
+import cloudscraper
+from bs4 import BeautifulSoup
+from cachetools import TTLCache, cached
+
+# Playwright async
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+
+# ---------- config ----------
+BASE = os.getenv("MANGATEK_BASE", "https://mangatek.com")
+USE_PLAYWRIGHT = os.getenv("USE_PLAYWRIGHT", "1") == "1"  # default on
+PLAYWRIGHT_PROXY = os.getenv("PLAYWRIGHT_PROXY")  # e.g. http://user:pass@host:port
+HTTP_PROXIES = os.getenv("HTTP_PROXIES")  # optional proxies for httpx/cloudscraper (not parsed here)
+CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))
+RATE_LIMIT = os.getenv("RATE_LIMIT", "15/minute")  # default
+PLAYWRIGHT_HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "1") == "1"
+
+HEADERS = {
+    "User-Agent": os.getenv("DEFAULT_UA", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("mangatek_scraper")
 
-# ---------- app & limiter ----------
-app = FastAPI(title="Mangatek Scraper API", version="0.4.0")
-RATE_LIMIT = os.getenv("RATE_LIMIT", "20/minute")
+# ---------- app & rate limiter ----------
+app = FastAPI(title="Mangatek Scraper (Playwright enabled)", version="0.4.0")
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
+app.add_exception_handler(429, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
-@app.exception_handler(RateLimitExceeded)
-async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    return JSONResponse(status_code=429, content={"detail": "Too many requests, slow down."})
-
-# ---------- config ----------
-BASE = os.getenv("MANGATEK_BASE", "https://mangatek.com")
-UA_POOL = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-]
-DEFAULT_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
-    "Referer": BASE + "/",
-}
-
-# caching
-CACHE_TTL = int(os.getenv("CACHE_TTL", "900"))
-cache = TTLCache(maxsize=2000, ttl=CACHE_TTL)
-
-# proxies: can supply HTTP_PROXIES as comma-separated list or HTTP_PROXY/HTTPS_PROXY single
-PROXIES_ENV = os.getenv("HTTP_PROXIES", "")
-PROXY_LIST = [p.strip() for p in PROXIES_ENV.split(",") if p.strip()]
-SINGLE_PROXY = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or None
-
-# if true, when failing upstream returns empty results instead of raising 502
-RETURN_EMPTY_ON_UPSTREAM_FAIL = os.getenv("RETURN_EMPTY_ON_UPSTREAM_FAIL", "false").lower() in ("1","true","yes")
+# ---------- cache ----------
+cache = TTLCache(maxsize=1024, ttl=CACHE_TTL)
 
 # ---------- helpers ----------
-from fastapi.responses import JSONResponse
-
-
 def try_soup(html: str):
     try:
         return BeautifulSoup(html, "lxml")
     except Exception:
         return BeautifulSoup(html, "html.parser")
-
 
 def extract_slug_from_href(href: str) -> str:
     if not href:
@@ -103,10 +72,9 @@ def extract_slug_from_href(href: str) -> str:
             pass
     return parts[-1]
 
-
-def find_json_arrays_in_text(text: str) -> List:
+def find_json_arrays_in_text(text: str) -> List[str]:
     found = []
-    arrays = re.findall(r"\[\s*(?:\"https?://[^\"]+\"(?:\s*,\s*\"https?://[^\"]+\")*)\s*\]", text)
+    arrays = re.findall(r'\[\s*(?:"https?://[^"]+"(?:\s*,\s*"https?://[^"]+")*)\s*\]', text)
     for a in arrays:
         try:
             parsed = json.loads(a)
@@ -138,109 +106,140 @@ def find_json_arrays_in_text(text: str) -> List:
             uniq.append(u); seen.add(u)
     return uniq
 
+# ---------- HTTP fetch helpers ----------
+async def fetch_page_playwright(url: str, timeout: int = 20) -> str:
+    """
+    Use Playwright to retrieve fully-rendered HTML. Returns HTML string.
+    """
+    logger.info("Playwright fetching: %s", url)
+    # Playwright launch options
+    chromium_args = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+    # Proxy config for Playwright if provided
+    pw_proxy = None
+    if PLAYWRIGHT_PROXY:
+        pw_proxy = {"server": PLAYWRIGHT_PROXY}
 
-def choose_proxy_for_request() -> Optional[str]:
-    if SINGLE_PROXY:
-        return SINGLE_PROXY
-    if PROXY_LIST:
-        return random.choice(PROXY_LIST)
-    return None
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=PLAYWRIGHT_HEADLESS, args=chromium_args, proxy=pw_proxy)
+            context = await browser.new_context(user_agent=HEADERS.get("User-Agent"), locale="en-US")
+            page = await context.new_page()
+            # navigate
+            try:
+                await page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+            except PlaywrightTimeoutError:
+                logger.warning("Playwright timeout on goto; trying 'load' then wait")
+                try:
+                    await page.goto(url, wait_until="load", timeout=timeout * 1000)
+                    await page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+            # optionally wait small time for dynamic content
+            await asyncio.sleep(0.3)
+            content = await page.content()
+            await context.close()
+            await browser.close()
+            return content
+    except Exception as e:
+        logger.exception("Playwright fetch failed for %s: %s", url, str(e))
+        raise
 
-
-# ---------- fetch helpers with anti-block logic ----------
-async def fetch_page_httpx(url: str, max_retries: int = 3, timeout: int = 20) -> str:
-    last_exc = None
-    for attempt in range(1, max_retries + 1):
-        ua = random.choice(UA_POOL)
-        headers = {**DEFAULT_HEADERS, "User-Agent": ua}
-        proxy = choose_proxy_for_request()
-        proxies_mapping = None
-        if proxy:
-            proxies_mapping = {"http://": proxy, "https://": proxy}
-        try:
-            logger.info("httpx try %s -> %s (UA=%s proxy=%s)", attempt, url, ua, proxy)
-            timeout_cfg = httpx.Timeout(timeout)
-            async with httpx.AsyncClient(timeout=timeout_cfg, follow_redirects=True, proxies=proxies_mapping) as client:
-                resp = await client.get(url, headers=headers)
-                # handle Cloudflare-ish responses: 403 or challenge pages
-                if resp.status_code == 403 or resp.status_code == 429:
-                    last_exc = httpx.HTTPStatusError(f"{resp.status_code} for {url}", request=resp.request, response=resp)
-                    logger.warning("httpx got %s for %s (attempt %s)", resp.status_code, url, attempt)
-                    # small wait then retry (maybe proxy rotate)
-                    await asyncio.sleep(1 + attempt)
-                    continue
-                resp.raise_for_status()
-                if resp.text and len(resp.text) > 50:
-                    return resp.text
-                last_exc = Exception("Empty or too short response")
-        except Exception as e:
-            last_exc = e
-            logger.warning("httpx request error for %s: %s (attempt %s)", url, str(e), attempt)
-        await asyncio.sleep(min(4, 1.5 ** attempt))
-    raise HTTPException(status_code=502, detail=f"Upstream fetch failed (httpx). last_error={str(last_exc)}")
-
+async def fetch_page_httpx(url: str, timeout: int = 20) -> str:
+    """
+    Async httpx fallback (no JS rendering).
+    """
+    logger.info("httpx fetching: %s", url)
+    proxies = None
+    # httpx expects "proxies" on client init as dict (optional)
+    if HTTP_PROXIES:
+        # user may set a single proxy string
+        proxies = {"all://": HTTP_PROXIES}
+    try:
+        async with httpx.AsyncClient(timeout=timeout, headers=HEADERS, proxies=proxies) as client:
+            r = await client.get(url, follow_redirects=True)
+            r.raise_for_status()
+            return r.text
+    except Exception as e:
+        logger.exception("httpx fetch failed for %s: %s", url, str(e))
+        raise
 
 def fetch_page_cloudscraper_sync(url: str, timeout: int = 20) -> str:
-    if not _HAS_CLOUDSCRAPER:
-        raise RuntimeError("cloudscraper not installed")
-    headers = {**DEFAULT_HEADERS, "User-Agent": random.choice(UA_POOL)}
-    scr = cloudscraper.create_scraper()
-    proxy = choose_proxy_for_request()
-    if proxy:
-        scr.proxies.update({"http": proxy, "https": proxy})
-    r = scr.get(url, headers=headers, timeout=timeout)
-    r.raise_for_status()
-    return r.text
-
+    """
+    Synchronous cloudscraper fallback (blocking). Run via to_thread.
+    """
+    logger.info("cloudscraper fetching: %s", url)
+    try:
+        s = cloudscraper.create_scraper()
+        r = s.get(url, headers=HEADERS, timeout=timeout)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:
+        logger.exception("cloudscraper fetch failed for %s: %s", url, str(e))
+        raise
 
 async def fetch_html(url: str, timeout: int = 20) -> str:
-    # Try httpx first, but if 403 detected then try cloudscraper (blocking) as fallback
-    try:
-        return await fetch_page_httpx(url, max_retries=2, timeout=timeout)
-    except HTTPException as e:
-        # If it's a 403/Cloudflare-like, attempt cloudscraper
-        logger.warning("httpx failed; trying cloudscraper for %s; reason=%s", url, e.detail)
-        if _HAS_CLOUDSCRAPER:
-            try:
-                html = await asyncio.to_thread(fetch_page_cloudscraper_sync, url, timeout)
+    """
+    Try Playwright -> httpx -> cloudscraper (blocking) with logging.
+    Raises HTTPException on total failure.
+    """
+    last_exc = None
+    # 1) Playwright (preferred when enabled)
+    if USE_PLAYWRIGHT:
+        try:
+            html = await fetch_page_playwright(url, timeout=timeout)
+            if html and len(html) > 50:
                 return html
-            except Exception as ce:
-                logger.exception("cloudscraper also failed for %s", url)
-                raise HTTPException(status_code=502, detail=f"Both httpx and cloudscraper failed. last={str(ce)}")
-        else:
-            raise
+        except Exception as e:
+            last_exc = e
+            logger.warning("Playwright attempt failed: %s", str(e))
 
+    # 2) httpx async
+    try:
+        html = await fetch_page_httpx(url, timeout=timeout)
+        if html and len(html) > 50:
+            return html
+    except Exception as e:
+        last_exc = e
+        logger.warning("httpx attempt failed: %s", str(e))
 
-# -------------------- Endpoints (adapted) --------------------
+    # 3) cloudscraper (blocking)
+    try:
+        html = await asyncio.to_thread(fetch_page_cloudscraper_sync, url, timeout)
+        if html and len(html) > 50:
+            return html
+    except Exception as e:
+        last_exc = e
+        logger.warning("cloudscraper attempt failed: %s", str(e))
 
-@app.get("/_health")
-async def health():
-    return {"ok": True}
+    logger.error("Both Playwright/httpx/cloudscraper failed. last=%s", str(last_exc))
+    raise HTTPException(status_code=502, detail=f"Fetching failed. last={str(last_exc)}")
 
+# ---------- parsing helpers ----------
+def soup_from_html(html: str):
+    return try_soup(html)
 
-@app.get("/manga-list")
+# ---------- endpoints ----------
+@cached(cache)
 @limiter.limit(RATE_LIMIT)
+@app.get("/manga-list")
 async def manga_list(request: Request, sort: str = Query("views"), page: int = Query(1, ge=1)):
-    cache_key = f"list::{sort}::{page}"
-    if cache_key in cache:
-        return cache[cache_key]
-
     url = f"{BASE}/manga-list?sort={sort}"
     if page > 1:
         url += f"&page={page}"
-
     try:
         html = await fetch_html(url)
     except HTTPException as e:
-        logger.exception("Failed fetching manga-list: %s", e.detail)
-        if RETURN_EMPTY_ON_UPSTREAM_FAIL:
-            return {"items": [], "pagination": {"current": page, "pages": []}}
+        logger.error("Failed fetching manga-list: %s", e.detail)
         raise
+    except Exception as e:
+        logger.exception("Unexpected error fetching manga-list")
+        raise HTTPException(status_code=502, detail="Failed to fetch source")
 
-    soup = try_soup(html)
+    soup = soup_from_html(html)
     items = []
     seen_slugs = set()
 
+    # strategy A
     for a in soup.select("a.manga-card"):
         href = a.get("href") or ""
         slug = extract_slug_from_href(href)
@@ -248,10 +247,11 @@ async def manga_list(request: Request, sort: str = Query("views"), page: int = Q
             continue
         seen_slugs.add(slug)
         img = a.select_one("img")
-        title = (img.get("alt") if img and img.get("alt") else a.get_text(strip=True)) or slug
-        cover = img.get("data-src") or (img.get("src") if img else None)
+        title = (img.get("alt") if img else a.get_text(strip=True)) or slug
+        cover = img.get("src") if img else None
         items.append({"title": title.strip(), "slug": slug, "url": urljoin(BASE, href), "cover": cover})
 
+    # strategy B
     if not items:
         for a in soup.select("a[href*='/manga/']"):
             href = a.get("href") or ""
@@ -262,7 +262,7 @@ async def manga_list(request: Request, sort: str = Query("views"), page: int = Q
             title_el = a.select_one("h3") or a.select_one(".title") or a.select_one("h2")
             title = title_el.get_text(strip=True) if title_el else a.get_text(strip=True)
             img = a.select_one("img")
-            cover = img.get("data-src") or (img.get("src") if img else None)
+            cover = img.get("data-src") or img.get("src") if img else None
             items.append({"title": title.strip(), "slug": slug, "url": urljoin(BASE, href), "cover": cover})
 
     pagination = {"current": page, "pages": []}
@@ -273,35 +273,33 @@ async def manga_list(request: Request, sort: str = Query("views"), page: int = Q
             text = a.get_text(strip=True)
             pagination["pages"].append({"page": text, "url": urljoin(BASE, href)})
 
-    result = {"items": items, "pagination": pagination}
-    cache[cache_key] = result
-    return result
+    return {"items": items, "pagination": pagination, "note": None if items else "No items found; check logs."}
 
-
-@app.get("/manga/{slug}")
+@cached(cache)
 @limiter.limit(RATE_LIMIT)
+@app.get("/manga/{slug}")
 async def manga_detail(request: Request, slug: str):
-    cache_key = f"detail::{slug}"
-    if cache_key in cache:
-        return cache[cache_key]
-
     url = f"{BASE}/manga/{slug}"
     try:
         html = await fetch_html(url)
     except HTTPException as e:
-        logger.exception("manga_detail fetch failed: %s", e.detail)
-        if RETURN_EMPTY_ON_UPSTREAM_FAIL:
-            return {"title": slug, "slug": slug, "url": None, "description": None, "cover": None, "tags": [], "rating": None, "chapters": []}
+        logger.error("Upstream status or failure for %s: %s", url, e.detail)
         raise
+    except Exception:
+        logger.exception("Failed to fetch manga detail")
+        raise HTTPException(status_code=502, detail="Failed to fetch source")
 
-    soup = try_soup(html)
+    soup = soup_from_html(html)
     title_el = soup.select_one("h1") or soup.select_one(".title") or soup.select_one(".entry-title")
     title = title_el.get_text(strip=True) if title_el else slug
 
     desc = None
     desc_el = soup.select_one("p.text-gray-300") or soup.select_one(".description") or soup.select_one(".entry-content p") or soup.select_one("meta[name='description']")
     if desc_el:
-        desc = desc_el.get("content") if desc_el.name == "meta" else desc_el.get_text(strip=True)
+        if desc_el.name == "meta":
+            desc = desc_el.get("content")
+        else:
+            desc = desc_el.get_text(strip=True)
 
     cover = None
     cov = soup.select_one("img.cover") or soup.select_one(".cover img") or soup.select_one(".thumb img")
@@ -313,61 +311,69 @@ async def manga_detail(request: Request, slug: str):
     chapters = []
     for a in soup.select("a[href*='/reader/']"):
         href = a.get("href") or ""
-        chap_match = re.search(r"/reader/([^/]+)/([0-9]+)", href)
+        chap_match = re.search(r"/reader/([^/]+)/(\d+)", href)
         if chap_match:
+            chap_slug = chap_match.group(1)
             chap_num = chap_match.group(2)
-            chapters.append({"chapter_number": chap_num, "url": urljoin(BASE, href), "title": a.get_text(strip=True)})
-
+            title_text = a.get_text(strip=True)
+            chapters.append({"chapter_number": chap_num, "url": urljoin(BASE, href), "title": title_text})
     if not chapters:
         for a in soup.select("a[href*='/manga/']"):
             href = a.get("href") or ""
-            m = re.search(r"/manga/([^/]+)/([0-9]+)", href)
+            m = re.search(r"/manga/([^/]+)/(\d+)", href)
             if m:
                 chapters.append({"chapter_number": m.group(2), "url": urljoin(BASE, href), "title": a.get_text(strip=True)})
 
-    res = {"title": title, "slug": slug, "url": url, "description": desc, "cover": cover, "tags": tags, "rating": None, "chapters": chapters}
-    cache[cache_key] = res
-    return res
+    return {
+        "title": title,
+        "slug": slug,
+        "url": url,
+        "description": desc,
+        "cover": cover,
+        "tags": tags,
+        "rating": None,
+        "chapters": chapters
+    }
 
-
-@app.get("/reader/{slug}/{chapter}")
+@cached(cache)
 @limiter.limit(RATE_LIMIT)
-async def reader(request: Request, slug: str, chapter: int):
-    cache_key = f"reader::{slug}::{chapter}"
-    if cache_key in cache:
-        return cache[cache_key]
-
+@app.get("/reader/{slug}/{chapter}")
+async def reader(request: Request, slug: str, chapter: int, debug: Optional[bool] = Query(False)):
     url = f"{BASE}/reader/{slug}/{chapter}"
     try:
         html = await fetch_html(url)
     except HTTPException as e:
-        logger.exception("reader fetch failed: %s", e.detail)
-        if RETURN_EMPTY_ON_UPSTREAM_FAIL:
-            return {"slug": slug, "chapter": chapter, "images": []}
+        logger.error("Failed fetching reader page %s: %s", url, e.detail)
         raise
+    except Exception:
+        logger.exception("Failed to fetch reader page")
+        raise HTTPException(status_code=502, detail="Failed to fetch source")
 
-    soup = try_soup(html)
+    soup = soup_from_html(html)
     images = []
 
+    # Strategy 1: reader containers
     for sel in [".reader", ".reader-container", ".chapter-images", "#reader", ".rdminimal", ".page"]:
         container = soup.select_one(sel)
         if container:
-            for img in container.select("img"):
+            imgs = container.select("img")
+            for img in imgs:
                 src = img.get("data-src") or img.get("data-lazy-src") or img.get("src")
                 if src and not src.startswith("data:"):
                     images.append(src)
             if images:
                 break
 
+    # Strategy 2: fallback image scan
     if not images:
         for img in soup.select("article img, .page img, .chapter img, img"):
             src = img.get("data-src") or img.get("data-lazy-src") or img.get("src")
             if src and not src.startswith("data:"):
                 images.append(src)
 
+    # Strategy 3: parse scripts for image arrays
     if not images:
-        scripts = soup.find_all("script")
-        for s in scripts:
+        for s in soup.find_all("script"):
             text = s.string or s.get_text() or ""
             if not text or len(text) < 20:
                 continue
@@ -376,6 +382,7 @@ async def reader(request: Request, slug: str, chapter: int):
                 images.extend(found)
                 break
 
+    # cleanup & heuristics
     clean = []
     seen = set()
     for src in images:
@@ -395,10 +402,7 @@ async def reader(request: Request, slug: str, chapter: int):
             seen.add(src)
             clean.append(src)
 
-    result = {"slug": slug, "chapter": chapter, "images": clean}
-    cache[cache_key] = result
-    return result
-
+    return {"slug": slug, "chapter": chapter, "images": clean, "note": None if clean else "No images found; maybe JS-rendered or blocked."}
 
 @app.get("/reader/from-url")
 async def reader_from_url(url: str):
@@ -412,16 +416,20 @@ async def reader_from_url(url: str):
             raise HTTPException(status_code=400, detail="Only mangatek.com URLs allowed")
     except Exception:
         pass
-    m = re.search(r"/reader/([^/]+)/([0-9]+)", decoded)
+    m = re.search(r"/reader/([^/]+)/(\d+)", decoded)
     if m:
         slug = m.group(1)
         chapter = int(m.group(2))
-        return await reader(Request({}), slug, chapter)
+        return await reader(Request(scope={"type":"http"}), slug, chapter)
     m2 = re.search(r"/manga/([^/]+)", decoded)
     if m2:
         slug = m2.group(1)
         mnum = re.search(r"/(\d+)(?:/?)$", decoded)
         if mnum:
             chapter = int(mnum.group(1))
-            return await reader(Request({}), slug, chapter)
+            return await reader(Request(scope={"type":"http"}), slug, chapter)
     raise HTTPException(status_code=400, detail="Could not extract slug/chapter from URL")
+
+@app.get("/_health")
+def health():
+    return {"ok": True}
