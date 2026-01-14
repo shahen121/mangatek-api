@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 httpx
 beautifulsoup4
-lxml
 cachetools
-pydantic
+slowapi
+cloudscraper
+python-dotenv
